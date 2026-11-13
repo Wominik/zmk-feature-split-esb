@@ -14,56 +14,34 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 
-void zmk_split_esb_tx(struct zmk_split_esb_state *state) {
-    size_t tx_buf_len = ring_buf_size_get(state->tx_buf);
-    // LOG_DBG("tx_buf_len %u, CONFIG_ESB_MAX_PAYLOAD_LENGTH %u", 
-    //         tx_buf_len, CONFIG_ESB_MAX_PAYLOAD_LENGTH);
-    if (!tx_buf_len || tx_buf_len > CONFIG_ESB_MAX_PAYLOAD_LENGTH) {
-        return;
-    }
-    // Need at least prefix + postfix + meta
-    if (tx_buf_len < (sizeof(struct esb_msg_prefix) 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-    + sizeof(struct esb_msg_postfix) 
-#endif
-    + sizeof(struct esb_msg_meta)
-    )) {
-        return;
-    }
-    // LOG_DBG("tx_buf_len: %d", tx_buf_len);
-
+int zmk_split_esb_tx(struct zmk_split_esb_state *state, const uint8_t *msg, size_t msg_len,
+                     uint8_t max_retry) {
+    // One message per ESB payload, built on the caller's stack and handed
+    // straight to the TX queue. Nothing is shared with the ESB event
+    // handler, so a TX result arriving mid-way cannot pick up half a message.
     uint8_t buf[CONFIG_ESB_MAX_PAYLOAD_LENGTH];
-    size_t claim_len = 0;
-    while (claim_len < tx_buf_len) {
-        uint8_t *b;
-        uint32_t buf_len = ring_buf_get_claim(state->tx_buf, &b, tx_buf_len - claim_len);
-        if (buf_len <= 0) {
-            break;
-        }
-        memcpy(&buf[claim_len], b, buf_len);
-        claim_len += buf_len;
-    }
-    if (claim_len <= 0) {
-        return;
-    }
-    // LOG_DBG("tx_buf_len: %d, claim_len: %d", tx_buf_len, claim_len);
-    // LOG_HEXDUMP_DBG(buf, claim_len, "buf");
 
-    size_t meta_offset = claim_len - sizeof(struct esb_msg_meta);
-    struct esb_msg_meta meta;
-    memcpy(&meta, &buf[meta_offset], sizeof(meta));
+    if (msg_len + ESB_MSG_POSTFIX_SIZE > sizeof(buf)) {
+        LOG_ERR("Message of %d bytes does not fit an ESB payload", (int)msg_len);
+        return -EMSGSIZE;
+    }
+
+    memcpy(buf, msg, msg_len);
+
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
+    struct esb_msg_postfix postfix = {.crc = crc32_ieee(msg, msg_len)};
+    memcpy(&buf[msg_len], &postfix, sizeof(postfix));
+    msg_len += sizeof(postfix);
+    // LOG_HEXDUMP_DBG(&postfix, sizeof(postfix), "postfix");
+#endif
 
     app_esb_data_t tx_data = {
         .pipe = state->tx_pipe,
         .data = buf,
-        .len = meta_offset,
-        .msg_id = meta.msg_id,
-        .max_retry = meta.max_retry
+        .len = msg_len,
+        .max_retry = max_retry,
     };
-    zmk_split_esb_send(&tx_data); // callback > zmk_split_esb_cb()
-
-    // LOG_DBG("ESB TX Buf finish %d", claim_len);
-    ring_buf_get_finish(state->tx_buf, claim_len);
+    return zmk_split_esb_send(&tx_data); // callback > zmk_split_esb_cb()
 }
 
 static K_SEM_DEFINE(esb_cb_sem, 1, 1);
@@ -72,15 +50,9 @@ void zmk_split_esb_cb(app_esb_event_t *event, struct zmk_split_esb_state *state)
     switch(event->evt_type) {
         case APP_ESB_EVT_TX_SUCCESS:
             // LOG_DBG("ESB TX sent");
-            if (!ring_buf_is_empty(state->tx_buf)) {
-                zmk_split_esb_tx(state);
-            }
             break;
         case APP_ESB_EVT_TX_FAIL:
             // LOG_WRN("ESB TX failed");
-            if (!ring_buf_is_empty(state->tx_buf)) {
-                zmk_split_esb_tx(state);
-            }
             break;
         case APP_ESB_EVT_RX:
             // LOG_DBG("ESB RX received: {%d} %d", event->pipe, event->data_length);

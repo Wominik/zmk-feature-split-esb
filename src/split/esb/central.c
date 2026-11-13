@@ -29,16 +29,14 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 
 #include "app_esb.h"
 #include "common.h"
+#include "esb_crypto.h"
 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-#define TX_BUFFER_SIZE (sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix))
-#define RX_BUFFER_SIZE (sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix))
-#else
-#define TX_BUFFER_SIZE (sizeof(struct esb_command_envelope))
-#define RX_BUFFER_SIZE (sizeof(struct esb_event_envelope))
-#endif
+#define RX_BUFFER_SIZE (sizeof(struct esb_event_envelope) + ESB_MSG_POSTFIX_SIZE)
 
-RING_BUF_DECLARE(tx_buf, TX_BUFFER_SIZE * CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS);
+// Every command has to fit a single ESB payload, sealed or not
+BUILD_ASSERT(sizeof(struct esb_command_envelope) + ESB_MSG_POSTFIX_SIZE + ESB_CRYPTO_OVERHEAD <=
+                 CONFIG_ESB_MAX_PAYLOAD_LENGTH,
+             "CONFIG_ESB_MAX_PAYLOAD_LENGTH is too small for a central command");
 
 #define RX_RING_BUF_SIZE (RX_BUFFER_SIZE * CONFIG_ZMK_SPLIT_ESB_EVENT_BUFFER_ITEMS)
 struct ring_buf rx_bufs[CONFIG_ESB_PIPE_COUNT];
@@ -49,13 +47,8 @@ static void process_rx_cb(uint8_t pipe);
 static struct zmk_split_esb_state state = {
     .tx_pipe = 0,
     .process_rx_callback = process_rx_cb,
-    .tx_buf = &tx_buf,
     .rx_bufs = rx_bufs,
 };
-
-static void begin_tx(void) {
-    zmk_split_esb_tx(&state);
-}
 
 static ssize_t get_payload_data_size(const struct zmk_split_transport_central_command *cmd) {
     switch (cmd->type) {
@@ -85,14 +78,6 @@ static int split_central_esb_send_command(uint8_t source,
                         + sizeof(source)
                         + sizeof(enum zmk_split_transport_central_command_type);
 
-    if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + payload_size) {
-        LOG_WRN("No room to send command to the peripheral %d (have %d but only space for %d/%d)", 
-                source, ESB_MSG_EXTRA_SIZE + payload_size, ring_buf_space_get(&tx_buf),
-                ring_buf_capacity_get(&tx_buf));
-        ring_buf_reset(&tx_buf);
-        return -ENOSPC;
-    }
-
     struct esb_command_envelope env = {.prefix = {
                                             .magic_prefix = ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
                                             .payload_size = payload_size,
@@ -105,39 +90,9 @@ static int split_central_esb_send_command(uint8_t source,
     size_t cmd_env_len = sizeof(env.prefix) + payload_size;
     // LOG_HEXDUMP_DBG(&env, cmd_env_len, "Payload");
 
-    size_t put = ring_buf_put(&tx_buf, (uint8_t *)&env, cmd_env_len);
-    if (put != cmd_env_len) {
-        LOG_WRN("Failed to put the whole message (%d vs %d)", put, cmd_env_len);
-    }
-
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-    struct esb_msg_postfix postfix = {.crc = crc32_ieee((void *)&env, cmd_env_len)};
-
-    put = ring_buf_put(&tx_buf, (uint8_t *)&postfix, sizeof(postfix));
-    if (put != sizeof(postfix)) {
-        LOG_WRN("Failed to put the postfix (%d vs %d)", put, sizeof(postfix));
-    }
-#endif
-
-    static uint16_t cmd_msg_id = 0;
-    if (++cmd_msg_id >= UINT16_MAX - 1000) {
-        cmd_msg_id = 1;
-    }
-    // LOG_INF("cmd_msg_id: %d", cmd_msg_id);
-
-    uint8_t max_retry = CONFIG_ZMK_SPLIT_ESB_RETRY_CMD;
-    struct esb_msg_meta meta = {.msg_id = cmd_msg_id, .max_retry = max_retry};
-
-    put = ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
-    if (put != sizeof(meta)) {
-        LOG_WRN("Failed to put the meta (%d vs %d)", put, sizeof(meta));
-    }
-
     state.tx_pipe = source % CONFIG_ESB_PIPE_COUNT;
 
-    begin_tx();
-
-    return 0;
+    return zmk_split_esb_tx(&state, (uint8_t *)&env, cmd_env_len, CONFIG_ZMK_SPLIT_ESB_RETRY_CMD);
 }
 
 void zmk_split_esb_on_prx_esb_callback(app_esb_event_t *event) {

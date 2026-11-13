@@ -137,6 +137,52 @@ config ZMK_SPLIT_ESB_AUTO_HEAL_KEY_POS_MAX
     help
         Central shield config, equals to number of keys in keymaps
 
+config ZMK_SPLIT_ESB_CRYPTO
+    bool "Encrypt and authenticate the ESB link"
+    select NRF_OBERON
+    select HWINFO
+    select SETTINGS
+    help
+        Seals every packet in both directions with ChaCha20-Poly1305 and
+        rejects forged, replayed and duplicated packets.
+
+        The key is not part of the firmware: it is read from a flash block
+        (see ZMK_SPLIT_ESB_CRYPTO_KEY_ADDR) that is written once per device
+        with its own UF2 file, so firmware built in public CI holds no
+        secret. All devices of one keyboard, including every dongle, get the
+        same key.
+
+        A device WITHOUT a valid key block keeps talking unsealed, as if
+        this option were off. A device WITH one neither sends nor accepts
+        anything unsealed.
+
+        Needs CONFIG_ESB_MAX_PAYLOAD_LENGTH >= 80 (29 bytes are added to
+        each packet) and, on peripherals that report battery,
+        CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE >= 1536. Costs one small
+        flash write per boot.
+
+if ZMK_SPLIT_ESB_CRYPTO
+
+config ZMK_SPLIT_ESB_CRYPTO_KEY_ADDR
+    hex "Flash address of the key block"
+    default 0xE8000
+    help
+        Must be inside the region the UF2 bootloader lets an application
+        file write, outside the firmware image and outside the settings
+        partition. The default suits the Adafruit nRF52840 bootloader with
+        ZMK's usual layout (code up to 0xEC000, of which the bootloader
+        accepts writes below 0xEA000).
+
+config ZMK_SPLIT_ESB_CRYPTO_MAX_PEERS
+    int "Number of devices to keep replay state for"
+    default 4
+    range 1 16
+    help
+        On a dongle: at least the number of peripherals. On a peripheral:
+        at least the number of dongles it is used with.
+
+endif # ZMK_SPLIT_ESB_CRYPTO
+
 config ZMK_SPLIT_ESB_USE_TIMESLOT
     bool "Use MPSL timeslot to schedule radio"
     depends on BLE

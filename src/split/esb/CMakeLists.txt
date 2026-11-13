@@ -21,6 +21,12 @@ else ()
 endif()
 zephyr_library_include_directories(.)
 
+if(CONFIG_ZMK_SPLIT_ESB_CRYPTO)
+    zephyr_library_sources(esb_crypto.c)
+    # ChaCha20-Poly1305 from nrf_oberon (nrfxlib), see CONFIG_NRF_OBERON
+    zephyr_library_link_libraries(nrfxlib_crypto)
+endif()
+
 set(CENTRAL_H "${APPLICATION_SOURCE_DIR}/../app/include/zmk/split/central.h")
 file(READ "${CENTRAL_H}" CONTENTS)
 set(DEFAULT_LINE "#define ZMK_SPLIT_CENTRAL_PERIPHERAL_COUNT MAX(BLE_PERIPHERAL_COUNT, WIRED_PERIPHERAL_COUNT)")

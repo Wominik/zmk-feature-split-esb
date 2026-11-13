@@ -31,7 +31,6 @@ typedef struct {
     uint8_t pipe;
     uint8_t *data;
     uint32_t len;
-    uint16_t msg_id;
     uint8_t max_retry;
 } app_esb_data_t;
 

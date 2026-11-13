@@ -29,16 +29,14 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_SPLIT_ESB_LOG_LEVEL);
 
 #include "app_esb.h"
 #include "common.h"
+#include "esb_crypto.h"
 
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-#define TX_BUFFER_SIZE (sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_postfix) + sizeof(struct esb_msg_meta))
-#define RX_BUFFER_SIZE (sizeof(struct esb_command_envelope) + sizeof(struct esb_msg_postfix))
-#else
-#define TX_BUFFER_SIZE (sizeof(struct esb_event_envelope) + sizeof(struct esb_msg_meta))
-#define RX_BUFFER_SIZE (sizeof(struct esb_command_envelope))
-#endif
+#define RX_BUFFER_SIZE (sizeof(struct esb_command_envelope) + ESB_MSG_POSTFIX_SIZE)
 
-RING_BUF_DECLARE(tx_buf, TX_BUFFER_SIZE * CONFIG_ZMK_SPLIT_ESB_EVENT_BUFFER_ITEMS);
+// Every event has to fit a single ESB payload, sealed or not
+BUILD_ASSERT(sizeof(struct esb_event_envelope) + ESB_MSG_POSTFIX_SIZE + ESB_CRYPTO_OVERHEAD <=
+                 CONFIG_ESB_MAX_PAYLOAD_LENGTH,
+             "CONFIG_ESB_MAX_PAYLOAD_LENGTH is too small for a peripheral event");
 
 #define RX_RING_BUF_SIZE (RX_BUFFER_SIZE * CONFIG_ZMK_SPLIT_ESB_CMD_BUFFER_ITEMS)
 struct ring_buf rx_bufs[CONFIG_ESB_PIPE_COUNT];
@@ -51,13 +49,8 @@ static void process_rx_cb(uint8_t pipe);
 static struct zmk_split_esb_state state = {
     .tx_pipe = CONFIG_ZMK_SPLIT_ESB_PERIPHERAL_ID % CONFIG_ESB_PIPE_COUNT,
     .process_rx_callback = process_rx_cb,
-    .tx_buf = &tx_buf,
     .rx_bufs = rx_bufs,
 };
-
-static void begin_tx(void) {
-    zmk_split_esb_tx(&state);
-}
 
 void zmk_split_esb_on_ptx_esb_callback(app_esb_event_t *event) {
     zmk_split_esb_cb(event, &state);
@@ -105,14 +98,6 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
                         + sizeof(peripheral_id)
                         + sizeof(enum zmk_split_transport_peripheral_event_type);
 
-    if (ring_buf_space_get(&tx_buf) < ESB_MSG_EXTRA_SIZE + payload_size) {
-        LOG_WRN("No room to send event to the central (have %d but only space for %d/%d)",
-                ESB_MSG_EXTRA_SIZE + payload_size, ring_buf_space_get(&tx_buf),
-                ring_buf_capacity_get(&tx_buf));
-        ring_buf_reset(&tx_buf);
-        return -ENOSPC;
-    }
-
     struct esb_event_envelope env = {.prefix = {
                                         .magic_prefix = ZMK_SPLIT_ESB_ENVELOPE_MAGIC_PREFIX,
                                         .payload_size = payload_size,
@@ -125,39 +110,7 @@ split_peripheral_esb_report_event(const struct zmk_split_transport_peripheral_ev
     size_t evt_env_len = sizeof(env.prefix) + payload_size;
     // LOG_HEXDUMP_DBG(&env, evt_env_len, "ota payload");
 
-    size_t put = ring_buf_put(&tx_buf, (uint8_t *)&env, evt_env_len);
-    if (put != evt_env_len) {
-        LOG_WRN("Failed to put the whole message (%d vs %d)", put, evt_env_len);
-    }
-
-#if IS_ENABLED(CONFIG_ZMK_SPLIT_ESB_MSG_POSTFIX_CRC)
-    struct esb_msg_postfix postfix = {.crc = crc32_ieee((void *)&env, evt_env_len)};
-
-    put = ring_buf_put(&tx_buf, (uint8_t *)&postfix, sizeof(postfix));
-    if (put != sizeof(postfix)) {
-        LOG_WRN("Failed to put the postfix (%d vs %d)", put, sizeof(postfix));
-    }
-    // LOG_HEXDUMP_DBG(&postfix, sizeof(postfix), "postfix");
-#endif
-
-    static uint16_t evt_msg_id = 0;
-    if (++evt_msg_id >= UINT16_MAX - 1000) {
-        evt_msg_id = 1;
-    }
-    // LOG_INF("evt_msg_id: %d", evt_msg_id);
-
-    uint8_t max_retry = get_retry_count(event);
-    struct esb_msg_meta meta = {.msg_id = evt_msg_id, .max_retry = max_retry};
-
-    put = ring_buf_put(&tx_buf, (uint8_t *)&meta, sizeof(meta));
-    if (put != sizeof(meta)) {
-        LOG_WRN("Failed to put the meta (%d vs %d)", put, sizeof(meta));
-    }
-    // LOG_HEXDUMP_DBG(&meta, sizeof(meta), "meta");
-
-    begin_tx();
-
-    return 0;
+    return zmk_split_esb_tx(&state, (uint8_t *)&env, evt_env_len, get_retry_count(event));
 }
 
 static zmk_split_transport_peripheral_status_changed_cb_t transport_status_cb;
@@ -231,7 +184,6 @@ static void process_rx_work_cb(struct k_work *work) {
             switch (item_err) {
             case 0:
                 if (env.payload.cmd.type == ZMK_SPLIT_TRANSPORT_CENTRAL_CMD_TYPE_POLL_EVENTS) {
-                    // begin_tx(); // NOTE: Shall NOT be called from central due to ESB natural.
                     break;
                 }
                 if (env.payload.source != peripheral_id) {
